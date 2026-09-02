@@ -309,13 +309,136 @@ int HermesAdpcm::decode(const uint8_t* input, size_t inputBytes, int16_t* sample
 
 HermesSocketIO::HermesSocketIO() 
   : _client(&_plainClient), _connected(false), _namespaceReady(false), 
-    _wsUpgraded(false), _port(80), _useSSL(false), _connectTime(0), 
-    _lastActivity(0), _lastPing(0), _failureCount(0), _firstData(false) {
+    _wsUpgraded(false), _port(80), _useSSL(false), _connectTime(0),
+    _lastActivity(0), _lastPing(0), _failureCount(0), _firstData(false),
+    _proxyPort(0) {
   _namespace = "/global-agent";
 }
 
 HermesSocketIO::~HermesSocketIO() {
   disconnect();
+}
+
+// ============================================================
+// 代理配置
+// ============================================================
+
+void HermesSocketIO::setProxy(const String& host, uint16_t port, const String& user, const String& pass) {
+  _proxyHost = host;
+  _proxyPort = port;
+  _proxyUser = user;
+  _proxyPass = pass;
+  Serial.printf("[Proxy] 配置代理: %s:%d\n", host.c_str(), port);
+}
+
+void HermesSocketIO::clearProxy() {
+  _proxyHost = "";
+  _proxyPort = 0;
+  _proxyUser = "";
+  _proxyPass = "";
+}
+
+/**
+ * 通过 HTTP CONNECT 代理建立隧道
+ * 返回 true=隧道建立成功
+ */
+bool HermesSocketIO::connectThroughProxy(const String& targetHost, uint16_t targetPort) {
+  if (_proxyHost.length() == 0) return false;
+  
+  Serial.printf("[Proxy] 连接到代理服务器 %s:%d...\n", _proxyHost.c_str(), _proxyPort);
+  
+  // 1. 连接到代理服务器
+  if (!_client->connect(_proxyHost.c_str(), _proxyPort)) {
+    Serial.println("[Proxy] 代理服务器连接失败");
+    return false;
+  }
+  
+  // 2. 发送 HTTP CONNECT 请求
+  Serial.printf("[Proxy] 请求 CONNECT %s:%d\n", targetHost.c_str(), targetPort);
+  _client->print("CONNECT " + targetHost + ":" + String(targetPort) + " HTTP/1.1\r\n");
+  _client->print("Host: " + targetHost + ":" + String(targetPort) + "\r\n");
+  
+  // 添加代理认证（如果需要）
+  if (_proxyUser.length() > 0) {
+    String auth = _proxyUser + ":" + _proxyPass;
+    String authBase64 = base64Encode(auth);
+    _client->print("Proxy-Authorization: Basic " + authBase64 + "\r\n");
+  }
+  
+  _client->print("Proxy-Connection: Keep-Alive\r\n");
+  _client->print("\r\n");
+  
+  // 3. 等待 200 Connection Established
+  uint32_t start = millis();
+  String response = "";
+  String prevLine;
+  
+  while (millis() - start < 10000) {
+    if (_client->available()) {
+      String line = _client->readStringUntil('\n');
+      
+      if (response.length() == 0) {
+        response = line;  // 保存第一行 (状态行)
+      }
+      
+      if (prevLine == "\r" || line == "\r") break;
+      if (line.length() > 0 && line != "\r") prevLine = line;
+    }
+  }
+  
+  // 4. 检查响应状态
+  if (response.indexOf("200") > 0) {
+    Serial.println("[Proxy] 隧道建立成功");
+    
+    // 读取剩余空行
+    while (_client->available()) {
+      String line = _client->readStringUntil('\n');
+      if (line == "\r" || line.length() == 0) break;
+    }
+    
+    return true;
+  }
+  
+  Serial.printf("[Proxy] 隧道建立失败: %s\n", response.c_str());
+  _client->stop();
+  return false;
+}
+
+/**
+ * Base64 编码（用于代理认证）
+ */
+String HermesSocketIO::base64Encode(const String& input) {
+  static const char b64Table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  
+  String output;
+  int i = 0;
+  uint8_t arr3[3], arr4[4];
+  int len = input.length();
+  
+  for (int j = 0; j < len; j++) {
+    arr3[i++] = input[j];
+    if (i == 3) {
+      arr4[0] = (arr3[0] & 0xFC) >> 2;
+      arr4[1] = ((arr3[0] & 0x03) << 4) | ((arr3[1] & 0xF0) >> 4);
+      arr4[2] = ((arr3[1] & 0x0F) << 2) | ((arr3[2] & 0xC0) >> 6);
+      arr4[3] = arr3[2] & 0x3F;
+      
+      for (int k = 0; k < 4; k++) output += b64Table[arr4[k]];
+      i = 0;
+    }
+  }
+  
+  if (i > 0) {
+    for (int j = i; j < 3; j++) arr3[j] = 0;
+    arr4[0] = (arr3[0] & 0xFC) >> 2;
+    arr4[1] = ((arr3[0] & 0x03) << 4) | ((arr3[1] & 0xF0) >> 4);
+    arr4[2] = ((arr3[1] & 0x0F) << 2) | ((arr3[2] & 0xC0) >> 6);
+    
+    for (int j = 0; j < i + 1; j++) output += b64Table[arr4[j]];
+    while (i++ < 3) output += '=';
+  }
+  
+  return output;
 }
 
 /**
@@ -352,46 +475,56 @@ bool HermesSocketIO::connect(const String& url) {
     if (_useSSL) _port = 443;
   }
   
-  Serial.printf("Socket.IO: 连接到 %s:%d (ssl=%d)\n", _host.c_str(), _port, _useSSL);
+  Serial.printf("Socket.IO: 连接到 %s:%d (ssl=%d, proxy=%s)\n", 
+                _host.c_str(), _port, _useSSL, _proxyHost.length() > 0 ? "yes" : "no");
   
-  // 建立 TCP 连接
-  if (_client->connect(_host.c_str(), _port)) {
-    // 发送 HTTP WebSocket 升级请求
-    String path = "/socket.io/?EIO=4&transport=websocket";
-    _client->print("GET " + path + " HTTP/1.1\r\n");
-    _client->print("Host: " + _host + "\r\n");
-    _client->print("Upgrade: websocket\r\n");
-    _client->print("Connection: Upgrade\r\n");
-    _client->print("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
-    _client->print("Sec-WebSocket-Version: 13\r\n");
-    _client->print("\r\n");
-    
-    // 读取 HTTP 响应直到空行
-    uint32_t upgradeStart = millis();
-    String prevLine;
-    while (millis() - upgradeStart < 3000) {
-      if (_client->available()) {
-        String resp = _client->readStringUntil('\n');
-        if (prevLine == "\r" || resp == "\r") break;
-        if (resp.length() > 0 && resp != "\r") prevLine = resp;
-      }
-    }
-    
-    _wsUpgraded = true;
-    _connected = true;
-    markConnected();
-    
-    // 发送 Engine.IO namespace connect
-    delay(100);
-    sendNamespaceConnect();
-    
-    Serial.println("Socket.IO: 连接成功");
-    return true;
+  // 建立 TCP 连接（直连或通过代理隧道）
+  bool connected = false;
+  if (_proxyHost.length() > 0) {
+    // 通过 HTTP CONNECT 代理建立隧道
+    connected = connectThroughProxy(_host, _port);
+  } else {
+    // 直连
+    connected = _client->connect(_host.c_str(), _port);
   }
   
-  _failureCount++;
-  Serial.printf("Socket.IO: 连接失败 (%d)\n", _failureCount);
-  return false;
+  if (!connected) {
+    _failureCount++;
+    Serial.printf("Socket.IO: 连接失败 (%d)\n", _failureCount);
+    return false;
+  }
+  
+  // 发送 HTTP WebSocket 升级请求
+  String path = "/socket.io/?EIO=4&transport=websocket";
+  _client->print("GET " + path + " HTTP/1.1\r\n");
+  _client->print("Host: " + _host + "\r\n");
+  _client->print("Upgrade: websocket\r\n");
+  _client->print("Connection: Upgrade\r\n");
+  _client->print("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+  _client->print("Sec-WebSocket-Version: 13\r\n");
+  _client->print("\r\n");
+  
+  // 读取 HTTP 响应直到空行
+  uint32_t upgradeStart = millis();
+  String prevLine;
+  while (millis() - upgradeStart < 3000) {
+    if (_client->available()) {
+      String resp = _client->readStringUntil('\n');
+      if (prevLine == "\r" || resp == "\r") break;
+      if (resp.length() > 0 && resp != "\r") prevLine = resp;
+    }
+  }
+  
+  _wsUpgraded = true;
+  _connected = true;
+  markConnected();
+  
+  // 发送 Engine.IO namespace connect
+  delay(100);
+  sendNamespaceConnect();
+  
+  Serial.println("Socket.IO: 连接成功");
+  return true;
 }
 
 /**
@@ -604,14 +737,25 @@ void HermesSocketIO::loop() {
       }
       handleMessage(payload);
     } else if (opcode == 0x2) {
-      // 二进制帧 - 跳过
+      // 二进制帧
       uint8_t buf[512];
       uint64_t remaining = length;
-      while (remaining > 0) {
-        size_t toRead = min(static_cast<size_t>(remaining), sizeof(buf));
-        if (!readBytes(buf, toRead)) break;
-        remaining -= toRead;
+      size_t totalRead = 0;
+      uint8_t* binaryBuf = nullptr;
+      if (length > 0) {
+        binaryBuf = (uint8_t*)malloc(length);
+        if (binaryBuf) {
+          while (remaining > 0) {
+            size_t toRead = min(static_cast<size_t>(remaining), sizeof(buf));
+            if (!readBytes(buf, toRead)) break;
+            memcpy(binaryBuf + totalRead, buf, toRead);
+            totalRead += toRead;
+            remaining -= toRead;
+          }
+          if (_binaryCb) _binaryCb(binaryBuf, totalRead);
+        }
       }
+      if (binaryBuf) free(binaryBuf);
     } else if (opcode == 0x8) {
       // 关闭帧
       _connected = false;
@@ -699,8 +843,7 @@ bool HermesSocketIO::parseEvent(const String& message, String* event, String* js
   }
   
   *json = arrayContent.substring(comma + 1);
-  // 去除首尾空格
-  *json = json->trim();
+  json->trim();
   
   return true;
 }
@@ -775,6 +918,7 @@ void HermesDevice::handleMcuAuth(const String& json) {
   reportReady();
   
   _authState = HermesAuthState::Authenticated;
+  _ui(HermesUiState::READY, "IP: " + WiFi.localIP().toString());
   Serial.println("HermesDevice: 认证成功");
 }
 
@@ -867,6 +1011,15 @@ void HermesDevice::handleReauthRequired() {
 }
 
 /**
+ * 通知 UI 状态变化
+ */
+void HermesDevice::_ui(HermesUiState state, const String& text) {
+  _uiState = state;
+  if (_uiStateCb) _uiStateCb(state, text);
+  Serial.printf("[UI] state=%d text=%s\n", (int)state, text.c_str());
+}
+
+/**
  * 构造函数
  * 初始化所有成员变量为默认值
  */
@@ -875,10 +1028,40 @@ HermesDevice::HermesDevice()
     _port(8648), _sampleRate(HERMES_DEFAULT_SAMPLE_RATE), 
     _recordMaxMs(HERMES_DEFAULT_RECORD_MAX_MS), _recordMinMs(HERMES_DEFAULT_RECORD_MIN_MS),
     _timerStartMs(0), _timerDuration(0), _timerRunning(false),
-    _timeSynced(false), _lastNtpSync(0), _webServer(nullptr), _webServerActive(false) {
+    _timeSynced(false), _lastNtpSync(0), _webServer(nullptr), _webServerActive(false),
+    _uiState(HermesUiState::BOOT), _proxyPort(0), _useProxy(false) {
   _deviceName = "HStudio-Device";
   _deviceType = "global_agent";
   _namespaceName = "/global-agent";
+}
+
+// ============================================================
+// 代理配置
+// ============================================================
+
+void HermesDevice::setProxyConfig(const String& host, uint16_t port, const String& user, const String& pass) {
+  _proxyHost = host;
+  _proxyPort = port;
+  _proxyUser = user;
+  _proxyPass = pass;
+  _useProxy = true;
+  
+  // 同时配置到 Socket.IO 客户端
+  _socket.setProxy(host, port, user, pass);
+  
+  Serial.printf("[Proxy] 设备代理配置: %s:%d\n", host.c_str(), port);
+}
+
+void HermesDevice::clearProxyConfig() {
+  _proxyHost = "";
+  _proxyPort = 0;
+  _proxyUser = "";
+  _proxyPass = "";
+  _useProxy = false;
+  
+  _socket.clearProxy();
+  
+  Serial.println("[Proxy] 设备代理已清除");
 }
 
 /**
@@ -903,6 +1086,7 @@ void HermesDevice::begin(const String& deviceName, const String& deviceType, con
   
   _socket.setNamespace(namespaceName);
   
+  _ui(HermesUiState::BOOT, _deviceName + " " + HERMES_DEVICE_LIB_VERSION);
   Serial.printf("HermesDevice: 初始化完成 (ID=%s, Code=%s)\n", _deviceId.c_str(), _deviceCode.c_str());
 }
 
@@ -928,7 +1112,18 @@ void HermesDevice::loadPreferences() {
   _savedSsid = _prefs.getString("wifi/ssid", "");
   _savedPass = _prefs.getString("wifi/pass", "");
   _gatewayUrl = _prefs.getString("mcu/active_url", "");
+  _proxyHost = _prefs.getString("mcu/proxy_host", "");
+  _proxyPort = _prefs.getUShort("mcu/proxy_port", 0);
+  _proxyUser = _prefs.getString("mcu/proxy_user", "");
+  _proxyPass = _prefs.getString("mcu/proxy_pass", "");
   _prefs.end();
+  
+  // 如果有保存的代理配置，自动应用
+  if (_proxyHost.length() > 0 && _proxyPort > 0) {
+    _useProxy = true;
+    _socket.setProxy(_proxyHost, _proxyPort, _proxyUser, _proxyPass);
+    Serial.printf("[Proxy] 已加载代理配置: %s:%d\n", _proxyHost.c_str(), _proxyPort);
+  }
 }
 
 /**
@@ -939,6 +1134,10 @@ void HermesDevice::saveCredentials() {
   _prefs.putString("wifi/ssid", _savedSsid);
   _prefs.putString("wifi/pass", _savedPass);
   _prefs.putString("mcu/active_url", _gatewayUrl);
+  _prefs.putString("mcu/proxy_host", _proxyHost);
+  _prefs.putUShort("mcu/proxy_port", _proxyPort);
+  _prefs.putString("mcu/proxy_user", _proxyUser);
+  _prefs.putString("mcu/proxy_pass", _proxyPass);
   _prefs.end();
 }
 
@@ -955,6 +1154,7 @@ void HermesDevice::clearCredentials() {
  * 连接 WiFi
  */
 bool HermesDevice::connectWifi(const String& ssid, const String& pass, bool save) {
+  _ui(HermesUiState::WIFI_CONNECTING, ssid);
   Serial.printf("WiFi: 连接到 %s\n", ssid.c_str());
   
   WiFi.mode(WIFI_STA);
@@ -974,10 +1174,13 @@ bool HermesDevice::connectWifi(const String& ssid, const String& pass, bool save
       _savedPass = pass;
       saveCredentials();
     }
-    Serial.printf("WiFi: 已连接, IP=%s\n", WiFi.localIP().toString().c_str());
+    String ip = WiFi.localIP().toString();
+    _ui(HermesUiState::WIFI_OK, "IP: " + ip);
+    Serial.printf("WiFi: 已连接, IP=%s\n", ip.c_str());
     return true;
   }
   
+  _ui(HermesUiState::ERROR, "WiFi failed");
   Serial.println("WiFi: 连接失败");
   return false;
 }
@@ -1009,6 +1212,7 @@ void HermesDevice::startSetupAp(const String& ssid, const String& password) {
     WiFi.softAP(ssid.c_str());
   }
   _apMode = true;
+  _ui(HermesUiState::AP_CONFIG, ssid);
   Serial.printf("AP: %s 已启动, IP=%s\n", ssid.c_str(), WiFi.softAPIP().toString().c_str());
 }
 
@@ -1017,6 +1221,8 @@ void HermesDevice::startSetupAp(const String& ssid, const String& password) {
  * 策略: mDNS → 网络扫描 → 保存的 URL
  */
 String HermesDevice::discoverGateway() {
+  _ui(HermesUiState::DISCOVER, "Finding gateway...");
+  
   // 1. 尝试 mDNS
   Serial.println("Gateway: 尝试 mDNS 发现...");
   int n = MDNS.queryService("http", "tcp");
@@ -1067,6 +1273,9 @@ bool HermesDevice::login(const String& account, const String& password, const St
   _password = password;
   _profile = profile;
   
+  _ui(HermesUiState::LOGIN, "Logging in...");
+  Serial.printf("Login: 登录 %s\n", account.c_str());
+  
   // HTTP POST 获取 token
   HTTPClient http;
   http.begin(_gatewayUrl + "/api/auth/mcu-login");
@@ -1080,6 +1289,7 @@ bool HermesDevice::login(const String& account, const String& password, const St
   int code = http.POST(payload);
   if (code != 200) {
     Serial.printf("Login: HTTP 失败 %d\n", code);
+    _ui(HermesUiState::ERROR, "Login failed: " + String(code));
     return false;
   }
   
@@ -1090,17 +1300,21 @@ bool HermesDevice::login(const String& account, const String& password, const St
   String token = HermesJson::getString(response, "token");
   if (token.length() == 0) {
     Serial.println("Login: 无 token");
+    _ui(HermesUiState::ERROR, "No token");
     return false;
   }
   
   _socket.setAuthToken(token);
   _authState = HermesAuthState::Authenticating;
   
+  _ui(HermesUiState::SOCKET, "Connecting...");
+  
   // 连接 Socket.IO
   if (_socket.connect(_gatewayUrl)) {
     return true;
   }
   
+  _ui(HermesUiState::ERROR, "Socket failed");
   return false;
 }
 
@@ -1287,15 +1501,64 @@ bool HermesDevice::syncTime(const char* ntpServer, long gmtOffset, int daylightO
 }
 
 /**
- * 主循环处理
+ * 主循环处理 — 统一状态机驱动
+ *
+ * 状态流转:
+ *   BOOT → WIFI_CONNECTING → WIFI_OK → DISCOVER → LOGIN → SOCKET → READY
+ *                   ↓ (失败)
+ *              AP_CONFIG (持续等待，不重启)
  */
 void HermesDevice::loop() {
+  static uint32_t lastReconnectAttempt = 0;
+  
   _socket.loop();
   
-  // 检查闹钟
-  checkAlarms();
+  // AP 配网模式 — 持续等待，不自动重启
+  if (_apMode) {
+    // TODO: 处理 Web 配网请求
+    return;
+  }
   
-  // 检查定时器
+  // WiFi 未连接 → 尝试连接
+  if (!_wifiConnected) {
+    if (_savedSsid.length() > 0) {
+      connectSavedWifi();
+    }
+    return;
+  }
+  
+  // WiFi 已连接但未开始发现 → 启动发现
+  if (_wifiConnected && _gatewayUrl.length() == 0 && _authState == HermesAuthState::Disconnected) {
+    String gw = discoverGateway();
+    if (gw.length() > 0) {
+      _gatewayUrl = gw;
+      saveCredentials();
+    } else {
+      // 未找到网关，进入 AP 配网
+      startSetupAp(_deviceName + "-" + _deviceCode.substring(4), "12345678");
+      return;
+    }
+  }
+  
+  // 有网关但未登录 → 登录
+  if (_gatewayUrl.length() > 0 && _authState == HermesAuthState::Disconnected) {
+    if (_account.length() > 0) {
+      login(_account, _password, _profile);
+    }
+    return;
+  }
+  
+  // 认证后 Socket 断开 → 重连
+  if (_authState == HermesAuthState::Authenticated && !_socket.isConnected()) {
+    if (millis() - lastReconnectAttempt > HERMES_SOCKET_RECONNECT_MS) {
+      lastReconnectAttempt = millis();
+      reconnectSocket();
+    }
+    return;
+  }
+  
+  // 已就绪 — 检查闹钟/定时器
+  checkAlarms();
   checkTimer();
 }
 

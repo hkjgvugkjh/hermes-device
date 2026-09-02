@@ -73,7 +73,7 @@
 // ============================================================
 // 版本信息
 // ============================================================
-#define HERMES_DEVICE_LIB_VERSION "1.0.0"
+#define HERMES_DEVICE_LIB_VERSION "2.1.0"
 
 // ============================================================
 // 配置常量 (可通过 #ifndef 在项目中自定义)
@@ -141,6 +141,28 @@ enum class HermesAuthState {
   Authenticating,   // 认证中 (等待 mcu.auth 事件)
   Authenticated,    // 已认证 (可以正常通信)
   Failed            // 认证失败 (token 过期或错误)
+};
+
+/**
+ * UI 状态枚举 — 所有设备共享的统一状态机
+ *
+ * 状态流转:
+ *   BOOT → WIFI_CONNECTING → WIFI_OK → DISCOVER → LOGIN → SOCKET → READY
+ *                   ↓ (失败)
+ *              AP_CONFIG (持续等待，不重启)
+ */
+enum class HermesUiState {
+  BOOT,             // 启动中
+  WIFI_CONNECTING,  // WiFi 连接中
+  WIFI_OK,          // WiFi 已连接
+  AP_CONFIG,        // AP 配网模式
+  DISCOVER,         // 网关发现中
+  LOGIN,            // 登录中
+  SOCKET,           // Socket.IO 连接中
+  READY,            // 就绪
+  RECORDING,        // 录音中
+  PLAYING,          // 播放中
+  ERROR             // 错误
 };
 
 /**
@@ -332,7 +354,7 @@ class HermesSocketIO {
 public:
   // 回调函数类型定义
   using EventCallback = std::function<void(const String& event, const String& json)>;
-  using RawMessageCallback = std::function<void(const String& message);
+  using RawMessageCallback = std::function<void(const String& message)>;
   
   HermesSocketIO();
   ~HermesSocketIO();
@@ -407,6 +429,7 @@ public:
   // --- 回调函数设置 ---
   void onEvent(EventCallback cb) { _eventCb = cb; }
   void onRawMessage(RawMessageCallback cb) { _rawMessageCb = cb; }
+  void onBinary(std::function<void(const uint8_t*, size_t)> cb) { _binaryCb = cb; }
   void onConnected(std::function<void()> cb) { _connectedCb = cb; }
   void onDisconnected(std::function<void()> cb) { _disconnectedCb = cb; }
   
@@ -415,6 +438,11 @@ public:
   uint32_t getLastActivity() const { return _lastActivity; }
   uint8_t getFailureCount() const { return _failureCount; }
   void resetFailureCount() { _failureCount = 0; }
+  
+  // --- 代理配置 ---
+  void setProxy(const String& host, uint16_t port, const String& user = "", const String& pass = "");
+  void clearProxy();
+  bool hasProxy() const { return _proxyHost.length() > 0; }
   
   // --- 认证令牌 ---
   void setAuthToken(const String& token) { _authToken = token; }
@@ -440,6 +468,12 @@ private:
   uint16_t _port;                   // 端口
   bool _useSSL;                     // 是否使用 SSL
   
+  // 代理配置
+  String _proxyHost;                // 代理服务器地址
+  uint16_t _proxyPort;              // 代理服务器端口
+  String _proxyUser;                // 代理认证用户名
+  String _proxyPass;                // 代理认证密码
+  
   // 连接统计
   uint32_t _connectTime;            // 连接建立时间
   uint32_t _lastActivity;           // 最后活动时间
@@ -450,6 +484,7 @@ private:
   // 回调函数
   EventCallback _eventCb;
   RawMessageCallback _rawMessageCb;
+  std::function<void(const uint8_t*, size_t)> _binaryCb;
   std::function<void()> _connectedCb;
   std::function<void()> _disconnectedCb;
   
@@ -469,6 +504,10 @@ private:
   // --- 连接状态管理 ---
   void markConnected();
   void markDisconnected();
+  
+  // --- 代理隧道 ---
+  bool connectThroughProxy(const String& targetHost, uint16_t targetPort);
+  String base64Encode(const String& input);
 };
 
 // ============================================================
@@ -517,6 +556,13 @@ public:
   void setGatewayUrl(const String& url) { _gatewayUrl = url; }
   const String& getGatewayUrl() const { return _gatewayUrl; }
   
+  // --- 代理配置 ---
+  void setProxyConfig(const String& host, uint16_t port, const String& user = "", const String& pass = "");
+  void clearProxyConfig();
+  bool hasProxyConfig() const { return _proxyHost.length() > 0; }
+  const String& getProxyHost() const { return _proxyHost; }
+  uint16_t getProxyPort() const { return _proxyPort; }
+  
   // --- 认证 ---
   bool login(const String& account, const String& password, const String& profile);
   void logout();
@@ -536,9 +582,11 @@ public:
   // --- 事件回调 ---
   void onInteraction(InteractionCallback cb) { _interactionCb = cb; }
   void onAudio(AudioCallback cb) { _audioCb = cb; }
+  void onAudioBinary(std::function<void(const uint8_t*, size_t, const String&, uint32_t)> cb) { _audioBinaryCb = cb; }
   void onNotification(NotificationCallback cb) { _notificationCb = cb; }
   void onSessionClear(std::function<void()> cb) { _sessionClearCb = cb; }
   void onAuthRequired(std::function<void()> cb) { _authRequiredCb = cb; }
+  void onUiState(std::function<void(HermesUiState, const String&)> cb) { _uiStateCb = cb; }
   
   // --- 通知管理 ---
   void addNotification(const String& title, const String& msg);
@@ -600,6 +648,13 @@ private:
   String _savedPass;                // 保存的 WiFi 密码
   String _gatewayUrl;               // 网关 URL
   
+  // 代理配置
+  String _proxyHost;                // HTTP 代理服务器地址
+  uint16_t _proxyPort;              // HTTP 代理服务器端口
+  String _proxyUser;                // 代理认证用户名
+  String _proxyPass;                // 代理认证密码
+  bool _useProxy;                   // 是否使用代理
+  
   // 认证状态
   HermesAuthState _authState;       // 认证状态
   String _account;                  // 账号
@@ -637,9 +692,12 @@ private:
   // 回调函数
   InteractionCallback _interactionCb;
   AudioCallback _audioCb;
+  std::function<void(const uint8_t*, size_t, const String&, uint32_t)> _audioBinaryCb;
   NotificationCallback _notificationCb;
   std::function<void()> _sessionClearCb;
   std::function<void()> _authRequiredCb;
+  std::function<void(HermesUiState, const String&)> _uiStateCb;
+  HermesUiState _uiState;            // 当前 UI 状态
   
   // 持久化存储
   Preferences _prefs;
@@ -649,6 +707,7 @@ private:
   void loadPreferences();           // 加载保存的配置
   void saveCredentials();           // 保存认证信息
   void clearCredentials();          // 清除认证信息
+  void _ui(HermesUiState state, const String& text = "");  // 通知 UI 状态变化
   void handleSocketEvent(const String& event, const String& json);
   void handleMcuAuth(const String& json);
   void handleInteractionStatus(const String& json);
