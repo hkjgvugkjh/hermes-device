@@ -496,6 +496,15 @@ bool HermesSocketIO::connect(const String& url) {
   
   // 发送 HTTP WebSocket 升级请求
   String path = "/socket.io/?EIO=4&transport=websocket";
+  // Socket.IO v4: 服务器中间件从 handshake.auth 读取 token/deviceCode
+  // 必须在 HTTP 请求中发送，不能只在 CONNECT 帧中
+  if (_authToken.length() > 0) {
+    path += "&token=" + _authToken;
+  }
+  if (_deviceCode.length() > 0) {
+    path += "&deviceCode=" + _deviceCode;
+    path += "&device_code=" + _deviceCode;
+  }
   _client->print("GET " + path + " HTTP/1.1\r\n");
   _client->print("Host: " + _host + "\r\n");
   _client->print("Upgrade: websocket\r\n");
@@ -519,9 +528,8 @@ bool HermesSocketIO::connect(const String& url) {
   _connected = true;
   markConnected();
   
-  // 发送 Engine.IO namespace connect
-  delay(100);
-  sendNamespaceConnect();
+  // 注意：不在这里发送 namespace connect，等收到 Engine.IO OPEN (0) 帧后再发
+  // sendNamespaceConnect();  // 删除此行！
   
   Serial.println("Socket.IO: 连接成功");
   return true;
@@ -531,6 +539,7 @@ bool HermesSocketIO::connect(const String& url) {
  * 断开连接
  */
 void HermesSocketIO::disconnect() {
+  Serial.println("[disconnect] Closing connection");
   if (_client->connected()) {
     _client->stop();
   }
@@ -627,7 +636,11 @@ bool HermesSocketIO::readBytes(uint8_t* buffer, size_t length, uint32_t timeoutM
  * 格式: 42/namespace,["eventName",{json}]
  */
 bool HermesSocketIO::sendEvent(const String& event, const String& json) {
-  if (!_connected || !_namespaceReady || event.length() == 0) return false;
+  Serial.printf("[sendEvent] event=%s connected=%d nspReady=%d\n", event.c_str(), _connected, _namespaceReady);
+  if (!_connected || !_namespaceReady || event.length() == 0) {
+    Serial.println("[sendEvent] FAILED: not connected or namespace not ready");
+    return false;
+  }
   
   // 自动注入 apiToken (如果 JSON 中没有)
   String securedJson = json;
@@ -638,12 +651,13 @@ bool HermesSocketIO::sendEvent(const String& event, const String& json) {
   // 构建 Socket.IO 事件帧
   String payload;
   payload.reserve(securedJson.length() + event.length() + 28);
-  payload += "42" + _namespace + ",\"";
+  payload += "42" + _namespace + ",[\"";
   payload += HermesJson::escape(event);
   payload += "\",";
   payload += securedJson;
   payload += "]";
-  
+
+  Serial.printf("[sendEvent] payload=%s\n", payload.c_str());
   return sendRawWsText(payload);
 }
 
@@ -660,10 +674,20 @@ bool HermesSocketIO::sendJson(const String& json) {
  * 发送 namespace connect 请求
  * 格式: 40/namespace
  */
+void HermesSocketIO::setDeviceInfo(const String& deviceId, const String& deviceCode, const String& profile) {
+  _deviceId = deviceId;
+  _deviceCode = deviceCode;
+  _profile = profile;
+}
+
 bool HermesSocketIO::sendNamespaceConnect() {
   if (!_connected || _authToken.length() == 0) return false;
   
-  String frame = "40" + _namespace;
+  String payload = "{\"token\":\"" + HermesJson::escape(_authToken) + "\",\"deviceCode\":\"" + 
+                   _deviceCode + "\",\"device_code\":\"" + _deviceCode + "\",\"role\":\"hermes-studio\"," + 
+                   "\"instanceId\":\"" + _deviceId + "\",\"profile\":\"" + _profile + "\"}";
+  String frame = "40" + _namespace + "," + payload;
+  Serial.printf("[sendNamespaceConnect] %s\n", frame.c_str());
   sendRawWsText(frame);
   return true;
 }
@@ -779,6 +803,8 @@ void HermesSocketIO::loop() {
 void HermesSocketIO::handleMessage(const String& message) {
   if (_rawMessageCb) _rawMessageCb(message);
   
+  Serial.printf("[handleMessage] %s\n", message.c_str());
+
   // Engine.IO v4 协议
   if (message == "2") {
     // Ping from server
@@ -801,6 +827,20 @@ void HermesSocketIO::handleMessage(const String& message) {
     handleSocketIoEvent(message);
     return;
   }
+  // Engine.IO CLOSE
+  if (message.startsWith("1")) {
+    Serial.println("[handleMessage] Engine.IO CLOSE");
+    _connected = false;
+    markDisconnected();
+    return;
+  }
+  // Socket.IO DISCONNECT
+  if (message.startsWith("41")) {
+    Serial.printf("[handleMessage] Socket.IO DISCONNECT: %s\n", message.c_str());
+    _namespaceReady = false;
+    return;
+  }
+  Serial.printf("[handleMessage] Unknown: %s\n", message.c_str());
 }
 
 /**
@@ -861,6 +901,7 @@ void HermesSocketIO::markConnected() {
  * 标记连接断开
  */
 void HermesSocketIO::markDisconnected() {
+  Serial.println("[markDisconnected] Connection lost!");
   _connectTime = 0;
   _lastActivity = 0;
   if (_disconnectedCb) _disconnectedCb();
@@ -883,6 +924,7 @@ void HermesSocketIO::markDisconnected() {
  * - mcu.reauth.required: 需要重新认证
  */
 void HermesDevice::handleSocketEvent(const String& event, const String& json) {
+  Serial.printf("[handleSocketEvent] event=%s json=%s\n", event.c_str(), json.c_str());
   if (event == "mcu.auth") {
     handleMcuAuth(json);
   } else if (event == "mcu.interaction.status") {
@@ -891,7 +933,7 @@ void HermesDevice::handleSocketEvent(const String& event, const String& json) {
     handleAudioEnqueue(json);
   } else if (event == "mcu.session.clear") {
     handleSessionClear();
-  } else if (event == "mcu.auth.invalid") {
+  } else if (event == "mcu.auth.invalid" || event == "auth.invalid") {
     handleAuthInvalid();
   } else if (event == "mcu.reauth.required") {
     handleReauthRequired();
@@ -1085,6 +1127,7 @@ void HermesDevice::begin(const String& deviceName, const String& deviceType, con
   loadPreferences();
   
   _socket.setNamespace(namespaceName);
+  _socket.setDeviceInfo(_deviceId, _deviceCode, _profile);
   
   _ui(HermesUiState::BOOT, _deviceName + " " + HERMES_DEVICE_LIB_VERSION);
   Serial.printf("HermesDevice: 初始化完成 (ID=%s, Code=%s)\n", _deviceId.c_str(), _deviceCode.c_str());
@@ -1272,6 +1315,7 @@ bool HermesDevice::login(const String& account, const String& password, const St
   _account = account;
   _password = password;
   _profile = profile;
+  _socket.setDeviceInfo(_deviceId, _deviceCode, _profile);
   
   _ui(HermesUiState::LOGIN, "Logging in...");
   Serial.printf("Login: 登录 %s\n", account.c_str());
@@ -1379,9 +1423,10 @@ void HermesDevice::reportStatus(const String& interactionId, const String& statu
  */
 void HermesDevice::reportReady() {
   String json = "{\"type\":\"mcu.ready\",\"id\":\"" + _deviceId + 
-                "\",\"active_device\":true,\"profile\":\"" + _profile + 
+                "\",\"active_device\":\"" + _deviceId + "\",\"profile\":\"" + _profile + 
                 "\",\"capabilities\":{\"display\":true,\"audio_queue\":true," +
                 "\"audio_playback\":true,\"pcm_stream\":false}}";
+  Serial.printf("[reportReady] Sending mcu.ready, apiToken=%s\n", _socket.getAuthToken().c_str());
   _socket.sendEvent("mcu.ready", json);
 }
 
@@ -1510,8 +1555,16 @@ bool HermesDevice::syncTime(const char* ntpServer, long gmtOffset, int daylightO
  */
 void HermesDevice::loop() {
   static uint32_t lastReconnectAttempt = 0;
+  static uint32_t lastAliveMsg = 0;
   
   _socket.loop();
+  
+  // Debug: print alive message every 10s
+  if (millis() - lastAliveMsg > 10000) {
+    lastAliveMsg = millis();
+    Serial.printf("[loop] authState=%d sockConnected=%d nspReady=%d\n", 
+                  (int)_authState, _socket.isConnected(), _socket.isNamespaceReady());
+  }
   
   // AP 配网模式 — 持续等待，不自动重启
   if (_apMode) {

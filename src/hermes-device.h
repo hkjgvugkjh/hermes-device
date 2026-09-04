@@ -73,7 +73,7 @@
 // ============================================================
 // 版本信息
 // ============================================================
-#define HERMES_DEVICE_LIB_VERSION "2.1.0"
+#define HERMES_DEVICE_LIB_VERSION "1.0.0"
 
 // ============================================================
 // 配置常量 (可通过 #ifndef 在项目中自定义)
@@ -390,6 +390,14 @@ public:
   bool sendEvent(const String& event, const String& json);
   
   /**
+   * 发送事件 (不注入 apiToken)
+   * @param event 事件名称
+   * @param json JSON payload (原样发送)
+   * @return true=发送成功
+   */
+  bool sendEventRaw(const String& event, const String& json);
+  
+  /**
    * 发送 JSON 消息 (自动提取 type 字段作为事件名)
    * @param json JSON 字符串
    * @return true=发送成功
@@ -451,6 +459,7 @@ public:
   // --- 命名空间 ---
   void setNamespace(const String& ns) { _namespace = ns; }
   const String& getNamespace() const { return _namespace; }
+  void setDeviceInfo(const String& deviceId, const String& deviceCode, const String& profile);
   
 private:
   // 网络客户端
@@ -464,6 +473,9 @@ private:
   bool _wsUpgraded;                 // WebSocket 是否已升级
   String _authToken;                // 认证令牌
   String _namespace;                // 命名空间 (默认 /global-agent)
+  String _deviceId;                 // 设备 ID
+  String _deviceCode;               // 设备代码
+  String _profile;                  // Profile
   String _host;                     // 主机地址
   uint16_t _port;                   // 端口
   bool _useSSL;                     // 是否使用 SSL
@@ -554,6 +566,11 @@ public:
   String discoverGateway();
   bool testGateway(const String& ip);
   void setGatewayUrl(const String& url) { _gatewayUrl = url; }
+  void setAccount(const String& account, const String& password, const String& profile) {
+    _account = account;
+    _password = password;
+    _profile = profile;
+  }
   const String& getGatewayUrl() const { return _gatewayUrl; }
   
   // --- 代理配置 ---
@@ -578,6 +595,7 @@ public:
   void reportStatus(const String& interactionId = "", const String& status = "", 
                     bool audioPlaying = false, uint32_t queueLength = 0);
   void reportReady();
+  void handleSocketEvent(const String& event, const String& json); // public — allow main.cpp to call
   
   // --- 事件回调 ---
   void onInteraction(InteractionCallback cb) { _interactionCb = cb; }
@@ -587,6 +605,8 @@ public:
   void onSessionClear(std::function<void()> cb) { _sessionClearCb = cb; }
   void onAuthRequired(std::function<void()> cb) { _authRequiredCb = cb; }
   void onUiState(std::function<void(HermesUiState, const String&)> cb) { _uiStateCb = cb; }
+  void onConnected(std::function<void()> cb) { _socket.onConnected(cb); }
+  void onEvent(std::function<void(const String&, const String&)> cb) { _socket.onEvent(cb); }
   
   // --- 通知管理 ---
   void addNotification(const String& title, const String& msg);
@@ -657,6 +677,7 @@ private:
   
   // 认证状态
   HermesAuthState _authState;       // 认证状态
+  uint8_t _authRetryCount;          // 认证重试次数
   String _account;                  // 账号
   String _password;                 // 密码
   String _profile;                  // Profile
@@ -708,7 +729,6 @@ private:
   void saveCredentials();           // 保存认证信息
   void clearCredentials();          // 清除认证信息
   void _ui(HermesUiState state, const String& text = "");  // 通知 UI 状态变化
-  void handleSocketEvent(const String& event, const String& json);
   void handleMcuAuth(const String& json);
   void handleInteractionStatus(const String& json);
   void handleAudioEnqueue(const String& json);
